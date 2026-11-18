@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 
 from . import __version__
-from .analysis import find_gaps, locate, pois_from_elements
+from .analysis import MERGE_M, find_gaps, locate, merge_nearby, pois_from_elements
 from .categories import CATEGORIES, FOOD, WATER, parse_category_list
 from .output import KM, MI, gap_message, missing_message, write_csv, write_map
 from .overpass import DEFAULT_ENDPOINTS, DiskCache, OverpassClient, OverpassError, default_cache_dir, fetch_elements
@@ -35,6 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"comma-separated subset of: {', '.join(CATEGORIES)} (default: all)")
     g.add_argument("--no-fuel-food", action="store_true",
                    help="don't count gas stations as food/water unless tagged with a shop")
+    g.add_argument("--merge-distance", type=float, default=MERGE_M,
+                   help="merge OSM features within this many metres that are one stop, e.g. a gas station "
+                   f"and its shop; 0 disables (default: {MERGE_M:g})")
 
     g = p.add_argument_group("gaps")
     g.add_argument("--units", choices=["km", "mi"], default="km", help="distance units for output (default: km)")
@@ -119,7 +122,7 @@ def main(argv: list[str] | None = None) -> int:
     missing = _merge_ranges([ranges[i] for i in missing_idx])
 
     pois = pois_from_elements(elements, categories, fuel_as_food=not args.no_fuel_food)
-    stops = locate(route, pois, args.radius)
+    stops = merge_nearby(locate(route, pois, args.radius), args.merge_distance)
     gaps = sorted(
         (g for res in (WATER, FOOD) if gap_limits[res] > 0 for g in find_gaps(route.length_m, stops, res, gap_limits[res])),
         key=lambda g: (g.start_m, g.resource),
@@ -131,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
     write_csv(csv_path, stops, gaps, units, missing)
     write_map(map_path, route, stops, gaps, units, missing)
 
-    counts = Counter(s.poi.category.label for s in stops)
+    counts = Counter(s.label for s in stops)
     unique = len({(s.poi.osm_type, s.poi.osm_id) for s in stops})
     log.info("Found %d resupply points (%d cue entries): %s", unique, len(stops),
              ", ".join(f"{k} {v}" for k, v in counts.most_common()) or "none")

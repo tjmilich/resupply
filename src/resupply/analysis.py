@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import bisect
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
 import shapely
 
-from .categories import FOOD, WATER, Category, classify, provides
+from .categories import CATEGORIES, FOOD, WATER, Category, classify, provides
 from .route import GEOD, Route
 
 ON_ROUTE_M = 20.0  # offsets below this are reported as "on route" (no side)
+MERGE_M = 60.0  # default distance for merging OSM features that are one real-world stop
+_PRIORITY = {k: i for i, k in enumerate(CATEGORIES)}
+# Categories that are often mapped as separate features of one business (a fuel station,
+# its shop, the market inside). Anything else only merges with its own category, so a park
+# fountain is never folded into the supermarket across the street.
+_SHOP_LIKE = {"fuel", "convenience", "supermarket"}
 
 
 @dataclass
@@ -36,7 +43,12 @@ class POI:
 
 @dataclass
 class Stop:
-    """One pass of the route by a POI. A POI passed twice yields two stops."""
+    """One pass of the route by a real-world stop. A stop passed twice yields two Stops.
+
+    ``poi`` is the primary OSM feature (its category sets the map icon and layer, its
+    location is plotted). ``also`` holds other features merged into the same stop, e.g. a
+    gas station's separately mapped convenience store.
+    """
 
     poi: POI
     along_m: float
@@ -44,10 +56,32 @@ class Stop:
     side: str  # "L", "R" or "" when on the route
     next_water_m: float | None = None
     next_food_m: float | None = None
+    also: list[POI] = field(default_factory=list)
+
+    @property
+    def pois(self) -> list[POI]:
+        return [self.poi, *self.also]
 
     @property
     def provides(self) -> frozenset:
-        return self.poi.provides
+        return frozenset().union(*(p.provides for p in self.pois))
+
+    @property
+    def name(self) -> str:
+        return next((p.name for p in self.pois if p.name), "")
+
+    @property
+    def categories(self) -> list[Category]:
+        seen = {p.category.key: p.category for p in self.pois}
+        return sorted(seen.values(), key=lambda c: _PRIORITY.get(c.key, 99))
+
+    @property
+    def label(self) -> str:
+        return " + ".join(c.label for c in self.categories)
+
+    def tag(self, key: str) -> str:
+        """First non-empty value of a tag across merged features (primary first)."""
+        return next((p.tags[key] for p in self.pois if p.tags.get(key)), "")
 
 
 @dataclass
@@ -138,6 +172,78 @@ def locate(route: Route, pois: list[POI], max_offset_m: float, pass_separation_m
     stops.sort(key=lambda s: (s.along_m, s.offset_m))
     annotate_next(stops)
     return stops
+
+
+def _norm_name(name: str) -> str:
+    name = name.lower().replace("\u2019", "").replace("'", "")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", name).split())
+
+
+def _same_business(a: str, b: str) -> bool:
+    """Names match if equal or one extends the other ("sinclair" / "sinclair dinomart")."""
+    return a == b or a.startswith(b + " ") or b.startswith(a + " ")
+
+
+def _can_merge(cluster: list[Stop], s: Stop, distance_m: float) -> bool:
+    first = cluster[0]
+    if abs(s.along_m - first.along_m) > max(4 * distance_m, 500.0):
+        return False  # different pass of the route
+    cats = {c.poi.category.key for c in cluster}
+    k = s.poi.category.key
+    if not ((k in _SHOP_LIKE and cats <= _SHOP_LIKE) or cats == {k}):
+        return False
+    name = _norm_name(s.poi.name)
+    if name and not all(_same_business(n, name) for n in (_norm_name(c.poi.name) for c in cluster) if n):
+        return False
+    _, _, d = GEOD.inv(
+        [c.poi.lon for c in cluster], [c.poi.lat for c in cluster], [s.poi.lon] * len(cluster), [s.poi.lat] * len(cluster)
+    )
+    # near some member, and not too far from the first one, so a dense strip can't chain together
+    return min(d) <= distance_m and d[0] <= 2 * distance_m
+
+
+def merge_nearby(stops: list[Stop], distance_m: float = MERGE_M) -> list[Stop]:
+    """Merge stops that are the same real-world place mapped as several OSM features.
+
+    Typical cases: a fuel station and its convenience store, several nodes for one
+    brand's pumps, unnamed pump nodes next to a named station, duplicate water taps.
+    Separately named businesses never merge, nor do different passes of the route.
+    """
+    if distance_m <= 0 or len(stops) < 2:
+        return list(stops)
+    clusters: list[list[Stop]] = []
+    for s in sorted(stops, key=lambda s: (s.along_m, s.offset_m)):
+        target = None
+        for c in reversed(clusters):
+            if s.along_m - c[0].along_m > max(4 * distance_m, 500.0):
+                break
+            if _can_merge(c, s, distance_m):
+                target = c
+                break
+        if target is None:
+            clusters.append([s])
+        else:
+            target.append(s)
+
+    merged = []
+    for c in clusters:
+        if len(c) == 1:
+            merged.append(c[0])
+            continue
+        primary = min(c, key=lambda s: (_PRIORITY.get(s.poi.category.key, 99), not s.poi.name, s.offset_m))
+        nearest = min(c, key=lambda s: s.offset_m)  # "how far off route" = the closest part of the stop
+        merged.append(
+            Stop(
+                primary.poi,
+                nearest.along_m,
+                nearest.offset_m,
+                nearest.side,
+                also=[s.poi for s in c if s is not primary],
+            )
+        )
+    merged.sort(key=lambda s: (s.along_m, s.offset_m))
+    annotate_next(merged)
+    return merged
 
 
 def annotate_next(stops: list[Stop]) -> None:

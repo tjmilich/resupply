@@ -31,6 +31,7 @@ Key options (`resupply -h` lists them all):
 | `-c/--categories` | all | `water,supermarket,fuel,convenience,campsite,bike_shop` |
 | `--max-gap` | 50 km / 30 mi | flag stretches with no water **or** no food longer than this |
 | `--max-water-gap`, `--max-food-gap` | = `--max-gap` | separate thresholds per resource (0 disables) |
+| `--merge-distance` | 60 m | merge features that are one real-world stop (0 = off) |
 | `--no-fuel-food` | off | don't count gas stations as food/water unless they're tagged with a shop |
 | `--simplify` | 50 m | Douglas–Peucker tolerance used for the query polyline |
 | `--chunk-points`, `--chunk-km` | 150, 50 | per-query limits |
@@ -62,6 +63,11 @@ Design notes:
   is missed. Results are then filtered against the true route with the requested radius.
 - **Multiple passes:** on out-and-back, loop and figure-eight routes, a POI next to two different parts of the route
   gets one cue row per pass. The map shows one marker with all the distances.
+- **Merging duplicates:** OpenStreetMap often maps one stop as several features, such as a fuel station, its shop
+  and individual pump nodes. Features within `--merge-distance` (60 m) on the same pass of the route become one cue
+  row, for example "Love's: Gas station + Convenience store". Separately named businesses never merge. Water,
+  campsites and bike shops merge only with their own kind. A feature must also be within 2× the merge distance of the
+  cluster's first feature, so a dense strip can't chain into one stop. Use `--merge-distance 0` to turn merging off.
 - **Category definitions** (`categories.py`) are structured tag conditions. They generate the Overpass filters and also
   classify the returned elements, so the two can't disagree. Features tagged `access=private|no` are skipped.
 - **What counts for gap analysis:** water taps and springs count as water. Supermarkets and convenience stores count as

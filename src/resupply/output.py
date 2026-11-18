@@ -35,19 +35,22 @@ _GAP_STYLE = {WATER: ("#d62728", None), FOOD: ("#ff7f0e", "10 8")}
 
 
 def _notes(stop: Stop) -> str:
-    t = stop.poi.tags
     notes = []
-    if t.get("fee") == "yes":
+    if any(p.tags.get("fee") == "yes" for p in stop.pois):
         notes.append("fee")
-    if t.get("seasonal") and t["seasonal"] != "no":
-        notes.append(f"seasonal: {t['seasonal']}")
-    if stop.poi.category.key == "campsite" and "drinking_water" in t:
-        notes.append(f"drinking_water={t['drinking_water']}")
-    if stop.poi.category.key == "fuel" and t.get("shop"):
-        notes.append(f"shop={t['shop']}")
-    if t.get("phone"):
-        notes.append(f"phone {t['phone']}")
-    return "; ".join(notes)
+    seasonal = stop.tag("seasonal")
+    if seasonal and seasonal != "no":
+        notes.append(f"seasonal: {seasonal}")
+    for p in stop.pois:
+        if p.category.key == "campsite" and "drinking_water" in p.tags:
+            notes.append(f"drinking_water={p.tags['drinking_water']}")
+        if p.category.key == "fuel" and p.tags.get("shop"):
+            notes.append(f"shop={p.tags['shop']}")
+    if stop.tag("phone"):
+        notes.append(f"phone {stop.tag('phone')}")
+    if stop.also:
+        notes.append(f"{len(stop.pois)} OSM features merged")
+    return "; ".join(dict.fromkeys(notes))
 
 
 def gap_message(gap: Gap, units: Units) -> str:
@@ -99,12 +102,12 @@ def write_csv(
                     units.dist(s.along_m, 2),
                     units.off(s.offset_m),
                     s.side,
-                    p.category.label,
-                    p.name,
-                    "+".join(sorted(p.provides)),
+                    s.label,
+                    s.name,
+                    "+".join(sorted(s.provides)),
                     units.dist(s.next_water_m),
                     units.dist(s.next_food_m),
-                    p.tags.get("opening_hours", ""),
+                    s.tag("opening_hours"),
                     f"{p.lat:.6f}",
                     f"{p.lon:.6f}",
                     p.osm_url,
@@ -142,17 +145,17 @@ def _popup(stops: list[Stop], units: Units) -> str:
     s0 = stops[0]
     p = s0.poi
     e = html.escape
-    title = e(p.name) or e(p.category.label)
+    title = e(s0.name) or e(s0.label)
     dists = ", ".join(f"{units.long} {units.dist(s.along_m)}" for s in stops)
     side = {"L": " left", "R": " right", "": ""}[s0.side]
     parts = [
         f"<b>{title}</b>",
-        e(p.category.label),
+        e(s0.label),
         f"At {dists}",
         f"{units.off(s0.offset_m)} {units.short} off route{side}",
     ]
-    if p.tags.get("opening_hours"):
-        parts.append(f"Hours: {e(p.tags['opening_hours'])}")
+    if s0.tag("opening_hours"):
+        parts.append(f"Hours: {e(s0.tag('opening_hours'))}")
     if s0.next_water_m is not None:
         parts.append(f"Next water: {units.dist(s0.next_water_m)} {units.long}")
     if s0.next_food_m is not None:
@@ -250,7 +253,8 @@ def write_map(
             ).add_to(miss_fg)
         miss_fg.add_to(m)
 
-    # POIs: one marker per OSM feature, listing every pass in the popup
+    # One marker per stop (keyed by its primary OSM feature), listing every pass in the popup.
+    # A merged stop sits in its primary category's layer.
     by_poi: dict[tuple[str, int], list[Stop]] = {}
     for s in stops:
         by_poi.setdefault((s.poi.osm_type, s.poi.osm_id), []).append(s)
@@ -263,7 +267,7 @@ def write_map(
             p = g[0].poi
             folium.Marker(
                 [p.lat, p.lon],
-                tooltip=html.escape(p.name or cat.label),
+                tooltip=html.escape(g[0].name or g[0].label),
                 popup=folium.Popup(_popup(g, units), max_width=320),
                 icon=folium.Icon(color=cat.color, icon=cat.icon, prefix="fa"),
             ).add_to(fg)
