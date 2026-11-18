@@ -52,10 +52,26 @@ def _notes(stop: Stop) -> str:
 
 def gap_message(gap: Gap, units: Units) -> str:
     until = "the finish" if gap.at_end else f"{units.long} {units.dist(gap.end_m)}"
-    return f"No {gap.resource} for {units.dist(gap.length_m)} {units.long} (until {until})"
+    msg = f"No {gap.resource} for {units.dist(gap.length_m)} {units.long} (until {until})"
+    if gap.uncertain:
+        msg += " - includes a stretch with no map data, may be wrong"
+    return msg
 
 
-def write_csv(path: str | Path, stops: list[Stop], gaps: list[Gap], units: Units = KM) -> None:
+def missing_message(start_m: float, end_m: float, units: Units) -> str:
+    return (
+        f"NO MAP DATA {units.long} {units.dist(start_m)}-{units.dist(end_m)}: the Overpass server "
+        "returned nothing usable; resupply here is unknown. Re-run later with --refresh"
+    )
+
+
+def write_csv(
+    path: str | Path,
+    stops: list[Stop],
+    gaps: list[Gap],
+    units: Units = KM,
+    missing: list[tuple[float, float]] = (),
+) -> None:
     """Cue sheet sorted by distance, with gap warnings inlined at the start of each gap."""
     header = [
         f"dist_{units.long}",
@@ -102,6 +118,12 @@ def write_csv(path: str | Path, stops: list[Stop], gaps: list[Gap], units: Units
         row[3] = f"GAP ({g.resource})"
         row[4] = gap_message(g, units)
         rows.append((g.start_m, 1, row))
+    for a, b in missing:
+        row = [""] * len(header)
+        row[0] = units.dist(a, 2)
+        row[3] = "NO DATA"
+        row[4] = missing_message(a, b, units)
+        rows.append((a, -1, row))
     rows.sort(key=lambda r: (r[0], r[1]))
     with Path(path).open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
@@ -141,18 +163,25 @@ def _popup(stops: list[Stop], units: Units) -> str:
     return "<br>".join(parts)
 
 
-def write_map(path: str | Path, route: Route, stops: list[Stop], gaps: list[Gap], units: Units = KM) -> None:
+def write_map(
+    path: str | Path,
+    route: Route,
+    stops: list[Stop],
+    gaps: list[Gap],
+    units: Units = KM,
+    missing: list[tuple[float, float]] = (),
+) -> None:
     lats, lons = route.lat, route.lon
     bounds = [[float(lats.min()), float(lons.min())], [float(lats.max()), float(lons.max())]]
     m = folium.Map(location=[float(lats.mean()), float(lons.mean())], zoom_start=10, tiles=None, control_scale=True)
-    folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
+    # CyclOSM is the default: tile.openstreetmap.org rejects requests without a Referer,
+    # which is exactly what a browser sends for a map opened as a local file.
     folium.TileLayer(
         tiles="https://{s}.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
         attr='<a href="https://www.cyclosm.org">CyclOSM</a> | Map data &copy; '
         '<a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
         name="CyclOSM",
         max_zoom=20,
-        show=False,
     ).add_to(m)
     folium.TileLayer(
         tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
@@ -160,6 +189,11 @@ def write_map(path: str | Path, route: Route, stops: list[Stop], gaps: list[Gap]
         'SRTM | Style &copy; <a href="https://opentopomap.org">OpenTopoMap</a> (CC-BY-SA)',
         name="OpenTopoMap",
         max_zoom=17,
+        show=False,
+    ).add_to(m)
+    folium.TileLayer(
+        "OpenStreetMap",
+        name="OpenStreetMap (blank if opened as a file)",
         show=False,
     ).add_to(m)
 
@@ -206,6 +240,16 @@ def write_map(path: str | Path, route: Route, stops: list[Stop], gaps: list[Gap]
                                 tooltip=html.escape(gap_message(g, units))).add_to(gap_fg)
         gap_fg.add_to(m)
 
+    if missing:
+        miss_fg = folium.FeatureGroup(name=f"No map data ({len(missing)})")
+        for a, b in missing:
+            folium.PolyLine(
+                route.slice_coords(a, b, tolerance_m=5.0),
+                color="#555555", weight=12, opacity=0.6, dash_array="4 10",
+                tooltip=html.escape(missing_message(a, b, units)),
+            ).add_to(miss_fg)
+        miss_fg.add_to(m)
+
     # POIs: one marker per OSM feature, listing every pass in the popup
     by_poi: dict[tuple[str, int], list[Stop]] = {}
     for s in stops:
@@ -232,6 +276,7 @@ def write_map(path: str | Path, route: Route, stops: list[Stop], gaps: list[Gap]
         f"<b>{html.escape(route.name)}</b><br>{units.dist(route.length_m)} {units.long} &middot; "
         f"{len(by_poi)} resupply points"
         + (f"<br><span style='color:#d62728'>{len(gaps)} gap(s) flagged</span>" if gaps else "")
+        + (f"<br><span style='color:#555'><b>{len(missing)} stretch(es) with no map data</b></span>" if missing else "")
     )
     m.get_root().html.add_child(folium.Element(
         f'<div style="position:fixed;bottom:24px;left:12px;z-index:9999;background:rgba(255,255,255,.92);'

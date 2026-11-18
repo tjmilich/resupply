@@ -69,6 +69,18 @@ Design notes:
   water only when tagged `drinking_water=yes`. Bike shops don't count for either.
 - **Cache:** responses are written atomically. Overpass runtime-error responses (HTTP 200 with an error `remark`) are
   retried and never cached.
+- **Bad-data detection:** public Overpass servers sometimes return an empty result that looks valid (HTTP 200, no
+  error). To catch this, each query also counts the roads within 150 m of the chunk. A count of zero means the answer
+  is bogus, so it's retried and never cached. If a stretch still has no usable data after the retries, it is marked
+  **NO DATA** in the CSV and on the map. Gaps that overlap it are labelled "may be wrong", and the tool exits with
+  code **3**.
+- **Failover:** a server that refuses the connection or never answers is skipped for the rest of the run. A
+  server that is only overloaded (429/5xx) is retried with backoff.
+- **Map tiles:** the default background is CyclOSM. `tile.openstreetmap.org` blocks maps opened from a local file,
+  because the browser sends no Referer. Standard OSM is still in the layer menu and works if the map is served over HTTP.
+
+Exit codes: `0` success, `1` error (bad GPX, Overpass unreachable), `2` bad arguments, `3` finished but some
+stretches had no usable map data.
 
 ## Layout
 

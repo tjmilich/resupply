@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "resupply"
-version = "0.1.0"
+version = "0.2.0"
 description = "Find water, food, fuel, camping and bike shops along a GPX route using OpenStreetMap"
 readme = "README.md"
 requires-python = ">=3.10"

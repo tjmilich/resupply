@@ -180,3 +180,23 @@ def chunk_coords(coords: list[LatLon], max_points: int = 150, max_length_m: floa
         cur_len += d
     chunks.append(cur)
     return chunks
+
+
+def chunk_ranges(chunks: list[list[LatLon]], route_length_m: float) -> list[tuple[float, float]]:
+    """Approximate along-route (start, end) distances of each chunk.
+
+    Chunk lengths are measured on the simplified polyline and scaled to the true
+    route length, which is accurate enough for reporting.
+    """
+    lengths = []
+    for c in chunks:
+        lat = np.array([p[0] for p in c])
+        lon = np.array([p[1] for p in c])
+        lengths.append(float(np.sum(GEOD.inv(lon[:-1], lat[:-1], lon[1:], lat[1:])[2])) if len(c) > 1 else 0.0)
+    total = sum(lengths) or 1.0
+    scale = route_length_m / total
+    out, pos = [], 0.0
+    for L in lengths:
+        out.append((pos, min(pos + L * scale, route_length_m)))
+        pos += L * scale
+    return out

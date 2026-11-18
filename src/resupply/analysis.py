@@ -57,6 +57,7 @@ class Gap:
     end_m: float
     at_start: bool = field(default=False)
     at_end: bool = field(default=False)
+    uncertain: bool = field(default=False)  # overlaps a stretch with no Overpass data
 
     @property
     def length_m(self) -> float:

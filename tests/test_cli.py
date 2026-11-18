@@ -66,3 +66,31 @@ def test_miles_and_custom_paths(write_gpx, tmp_path, monkeypatch):
 
 def test_missing_file_returns_error(tmp_path):
     assert cli.main([str(tmp_path / "nope.gpx"), "--no-cache"]) == 1
+
+
+def test_missing_chunk_flags_no_data_and_exit_code(write_gpx, tmp_path, monkeypatch):
+    from resupply.overpass import SuspectResponse
+
+    calls = []
+
+    def fake_fetch(self, q):
+        calls.append(q)
+        if len(calls) == 2:  # middle chunk: server keeps returning nothing
+            raise SuspectResponse("no data")
+        return {"elements": ELEMENTS}
+
+    monkeypatch.setattr(OverpassClient, "_fetch", fake_fetch)
+    gpx = write_gpx(straight_north())
+    out = tmp_path / "out"
+    argv = [str(gpx), "-o", str(out), "--no-cache", "--max-gap", "20", "--chunk-km", "20"]
+    assert cli.main(argv) == cli.EXIT_INCOMPLETE
+
+    with (out / "route_cues.csv").open() as f:
+        rows = list(csv.DictReader(f))
+    nodata = [r for r in rows if r["category"] == "NO DATA"]
+    assert len(nodata) == 1
+    start = float(nodata[0]["dist_km"])
+    assert 15 < start < 25  # second of three ~18.5 km chunks
+    gaps = [r for r in rows if r["category"].startswith("GAP")]
+    assert gaps and all("may be wrong" in r["name"] for r in gaps)  # both gaps cross the hole
+    assert "No map data (1)" in (out / "route_resupply.html").read_text()

@@ -11,9 +11,9 @@ from pathlib import Path
 from . import __version__
 from .analysis import find_gaps, locate, pois_from_elements
 from .categories import CATEGORIES, FOOD, WATER, parse_category_list
-from .output import KM, MI, gap_message, write_csv, write_map
+from .output import KM, MI, gap_message, missing_message, write_csv, write_map
 from .overpass import DEFAULT_ENDPOINTS, DiskCache, OverpassClient, OverpassError, default_cache_dir, fetch_elements
-from .route import RouteError, chunk_coords, load_gpx, simplified_coords
+from .route import RouteError, chunk_coords, chunk_ranges, load_gpx, simplified_coords
 
 log = logging.getLogger("resupply")
 
@@ -105,7 +105,9 @@ def main(argv: list[str] | None = None) -> int:
             cache = DiskCache(args.cache_dir or default_cache_dir(), ttl_s=ttl)
         client = OverpassClient(endpoints=args.endpoint or DEFAULT_ENDPOINTS, cache=cache)
         # widen the query corridor by the simplification tolerance; filter on the true route afterwards
-        elements = fetch_elements(client, chunks, args.radius + args.simplify, categories, refresh=args.refresh)
+        elements, missing_idx = fetch_elements(
+            client, chunks, args.radius + args.simplify, categories, refresh=args.refresh
+        )
     except RouteError as e:
         log.error("error: %s", e)
         return 1
@@ -113,16 +115,21 @@ def main(argv: list[str] | None = None) -> int:
         log.error("error: %s", e)
         return 1
 
+    ranges = chunk_ranges(chunks, route.length_m)
+    missing = _merge_ranges([ranges[i] for i in missing_idx])
+
     pois = pois_from_elements(elements, categories, fuel_as_food=not args.no_fuel_food)
     stops = locate(route, pois, args.radius)
     gaps = sorted(
         (g for res in (WATER, FOOD) if gap_limits[res] > 0 for g in find_gaps(route.length_m, stops, res, gap_limits[res])),
         key=lambda g: (g.start_m, g.resource),
     )
+    for g in gaps:
+        g.uncertain = any(a < g.end_m and b > g.start_m for a, b in missing)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    write_csv(csv_path, stops, gaps, units)
-    write_map(map_path, route, stops, gaps, units)
+    write_csv(csv_path, stops, gaps, units, missing)
+    write_map(map_path, route, stops, gaps, units, missing)
 
     counts = Counter(s.poi.category.label for s in stops)
     unique = len({(s.poi.osm_type, s.poi.osm_id) for s in stops})
@@ -136,7 +143,25 @@ def main(argv: list[str] | None = None) -> int:
         log.info("No gaps over the configured limits.")
     log.info("Map:       %s", map_path)
     log.info("Cue sheet: %s", csv_path)
+    if missing:
+        log.warning("WARNING: no usable map data for %d stretch(es); results there are incomplete:", len(missing))
+        for a, b in missing:
+            log.warning("  %s", missing_message(a, b, units))
+        return EXIT_INCOMPLETE
     return 0
+
+
+EXIT_INCOMPLETE = 3
+
+
+def _merge_ranges(ranges: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
+    for a, b in sorted(ranges):
+        if merged and a <= merged[-1][1] + 1.0:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
 
 
 if __name__ == "__main__":

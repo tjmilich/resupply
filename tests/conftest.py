@@ -51,7 +51,10 @@ class FakeSession:
 
     def post(self, url, data=None, timeout=None, headers=None):
         self.calls.append((url, data))
-        return self.responses.pop(0)
+        r = self.responses.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
 
 
 def node(osm_id, lat, lon, **tags):
