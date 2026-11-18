@@ -71,11 +71,17 @@ def test_missing_file_returns_error(tmp_path):
 def test_missing_chunk_flags_no_data_and_exit_code(write_gpx, tmp_path, monkeypatch):
     from resupply.overpass import SuspectResponse
 
+    import resupply.overpass as ov
+
+    monkeypatch.setattr(ov, "RETRY_ROUND_PAUSE_S", 0)
     calls = []
+    bad = {}
 
     def fake_fetch(self, q):
         calls.append(q)
-        if len(calls) == 2:  # middle chunk: server keeps returning nothing
+        if len(calls) == 2:
+            bad["q"] = q  # middle chunk: server keeps returning nothing, in both rounds
+        if q == bad.get("q"):
             raise SuspectResponse("no data")
         return {"elements": ELEMENTS}
 
@@ -94,3 +100,31 @@ def test_missing_chunk_flags_no_data_and_exit_code(write_gpx, tmp_path, monkeypa
     gaps = [r for r in rows if r["category"].startswith("GAP")]
     assert gaps and all("may be wrong" in r["name"] for r in gaps)  # both gaps cross the hole
     assert "No map data (1)" in (out / "route_resupply.html").read_text()
+
+
+def test_radius_spec_with_units_and_categories(write_gpx, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_fetch(self, q):
+        calls.append(q)
+        return {"elements": ELEMENTS}
+
+    monkeypatch.setattr(OverpassClient, "_fetch", fake_fetch)
+    gpx = write_gpx(straight_north())
+    out = tmp_path / "out"
+    # tap is ~430 m off route: excluded by water=0.2mi (~322 m); supermarket ~255 m stays
+    argv = [str(gpx), "-o", str(out), "--no-cache", "--units", "mi", "-r", "1mi,water=0.2mi", "--chunk-km", "100"]
+    assert cli.main(argv) == 0
+    assert '["amenity"="drinking_water"]["drinking_water"!="no"](around:372,' in calls[0]  # 322 + 50 simplify
+    assert '["shop"="supermarket"](around:1659,' in calls[0]
+    cats = [r["category"] for r in csv.DictReader((out / "route_cues.csv").open())]
+    assert "Drinking water" not in cats and "Supermarket" in cats
+
+
+def test_bad_radius_is_a_usage_error(write_gpx, capsys):
+    import pytest
+
+    with pytest.raises(SystemExit) as e:
+        cli.main([str(write_gpx(straight_north())), "-r", "water=far"])
+    assert e.value.code == 2
+    assert "can't read distance" in capsys.readouterr().err

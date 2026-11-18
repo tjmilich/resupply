@@ -9,11 +9,14 @@ from collections import Counter
 from pathlib import Path
 
 from . import __version__
-from .analysis import MERGE_M, find_gaps, locate, merge_nearby, pois_from_elements
+from .analysis import MERGE_M
 from .categories import CATEGORIES, FOOD, WATER, parse_category_list
+from .distances import describe_radii, parse_radius_spec
+from .extract import LocalExtract, find_extract
 from .output import KM, MI, gap_message, missing_message, write_csv, write_map
-from .overpass import DEFAULT_ENDPOINTS, DiskCache, OverpassClient, OverpassError, default_cache_dir, fetch_elements
-from .route import RouteError, chunk_coords, chunk_ranges, load_gpx, simplified_coords
+from .overpass import DEFAULT_ENDPOINTS, DiskCache, OverpassClient, OverpassError, default_cache_dir
+from .pipeline import Options, analyze, plan_chunks
+from .route import RouteError, load_gpx
 
 log = logging.getLogger("resupply")
 
@@ -29,8 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--csv", type=Path, help="cue sheet CSV path (default: <name>_cues.csv)")
 
     g = p.add_argument_group("search")
-    g.add_argument("-r", "--radius", type=float, default=1000.0,
-                   help="max offset from route in metres (default: 1000)")
+    g.add_argument("-r", "--radius", default="1km", metavar="SPEC",
+                   help="how far off the route to look. A distance like 500m, 1.5km, 0.5mi or 800ft "
+                   "(a bare number is metres), optionally per category: 'water=300m,campsite=5km' or "
+                   "'2km,water=300m' (the bare item is the default for the rest). Default: 1km"),
     g.add_argument("-c", "--categories", default="all",
                    help=f"comma-separated subset of: {', '.join(CATEGORIES)} (default: all)")
     g.add_argument("--no-fuel-food", action="store_true",
@@ -53,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--chunk-km", type=float, default=50.0, help="max route length per Overpass query (default: 50)")
     g.add_argument("--endpoint", action="append", help="Overpass endpoint URL (repeatable; default: public servers)")
 
+    g = p.add_argument_group("offline data")
+    g.add_argument("--extract", type=Path, metavar="DIR",
+                   help="pre-built OSM extract to use where it has coverage (default: $RESUPPLY_EXTRACT, "
+                   "else the one bundled with resupply)")
+    g.add_argument("--no-extract", action="store_true", help="always query the live Overpass API")
+
     g = p.add_argument_group("cache")
     g.add_argument("--cache-dir", type=Path, default=None, help=f"cache directory (default: {default_cache_dir()})")
     g.add_argument("--cache-ttl-days", type=float, default=30.0, help="cache lifetime; 0 = never expire (default: 30)")
@@ -73,12 +84,14 @@ def main(argv: list[str] | None = None) -> int:
         format="%(message)s",
         stream=sys.stderr,
     )
-    if args.radius <= 0:
-        parser.error("--radius must be positive")
     if args.chunk_points < 2:
         parser.error("--chunk-points must be at least 2")
     try:
         categories = parse_category_list(args.categories)
+    except ValueError as e:
+        parser.error(str(e))
+    try:
+        radii = parse_radius_spec(args.radius, categories)
     except ValueError as e:
         parser.error(str(e))
 
@@ -94,48 +107,55 @@ def main(argv: list[str] | None = None) -> int:
     map_path = args.map or out_dir / f"{stem}_resupply.html"
     csv_path = args.csv or out_dir / f"{stem}_cues.csv"
 
+    opts = Options(
+        categories=categories,
+        radii=radii,
+        gap_limits=gap_limits,
+        fuel_as_food=not args.no_fuel_food,
+        merge_distance_m=args.merge_distance,
+        simplify_m=args.simplify,
+        chunk_points=args.chunk_points,
+        chunk_km=args.chunk_km,
+        refresh=args.refresh,
+    )
+    extract: LocalExtract | None = None
+    if not args.no_extract:
+        try:
+            extract = find_extract(args.extract)
+        except (OSError, ValueError) as e:
+            parser.error(f"can't use extract: {e}")
+        if args.extract and extract is None:
+            parser.error(f"no extract found at {args.extract} (expected manifest.json)")
     try:
         route = load_gpx(args.gpx)
         log.info("Route '%s': %s %s, %d points", route.name, units.dist(route.length_m), units.long, len(route))
-
-        coords = simplified_coords(route, args.simplify)
-        chunks = chunk_coords(coords, args.chunk_points, args.chunk_km * 1000)
-        log.info("Simplified to %d points -> %d Overpass queries", len(coords), len(chunks))
+        log.info("Route split into %d stretches", len(plan_chunks(route, opts)))
+        log.info("Search distance from route: %s", describe_radii(radii, units.short, units.short_m))
 
         cache = None
         if not args.no_cache:
             ttl = args.cache_ttl_days * 86400 if args.cache_ttl_days > 0 else None
             cache = DiskCache(args.cache_dir or default_cache_dir(), ttl_s=ttl)
         client = OverpassClient(endpoints=args.endpoint or DEFAULT_ENDPOINTS, cache=cache)
-        # widen the query corridor by the simplification tolerance; filter on the true route afterwards
-        elements, missing_idx = fetch_elements(
-            client, chunks, args.radius + args.simplify, categories, refresh=args.refresh
-        )
+        result = analyze(route, opts, client, extract=extract)
     except RouteError as e:
         log.error("error: %s", e)
         return 1
     except OverpassError as e:
         log.error("error: %s", e)
         return 1
-
-    ranges = chunk_ranges(chunks, route.length_m)
-    missing = _merge_ranges([ranges[i] for i in missing_idx])
-
-    pois = pois_from_elements(elements, categories, fuel_as_food=not args.no_fuel_food)
-    stops = merge_nearby(locate(route, pois, args.radius), args.merge_distance)
-    gaps = sorted(
-        (g for res in (WATER, FOOD) if gap_limits[res] > 0 for g in find_gaps(route.length_m, stops, res, gap_limits[res])),
-        key=lambda g: (g.start_m, g.resource),
-    )
-    for g in gaps:
-        g.uncertain = any(a < g.end_m and b > g.start_m for a, b in missing)
+    stops, gaps, missing = result.stops, result.gaps, result.missing
+    if result.n_local_chunks:
+        live = result.n_chunks - result.n_local_chunks
+        log.info("%d of %d stretches from offline data (OSM data from %s)%s", result.n_local_chunks,
+                 result.n_chunks, result.extract_date or "unknown date", f"; {live} queried live" if live else "")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     write_csv(csv_path, stops, gaps, units, missing)
     write_map(map_path, route, stops, gaps, units, missing)
 
     counts = Counter(s.label for s in stops)
-    unique = len({(s.poi.osm_type, s.poi.osm_id) for s in stops})
+    unique = result.n_places
     log.info("Found %d resupply points (%d cue entries): %s", unique, len(stops),
              ", ".join(f"{k} {v}" for k, v in counts.most_common()) or "none")
     if gaps:
@@ -155,16 +175,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 EXIT_INCOMPLETE = 3
-
-
-def _merge_ranges(ranges: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    merged: list[tuple[float, float]] = []
-    for a, b in sorted(ranges):
-        if merged and a <= merged[-1][1] + 1.0:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
-        else:
-            merged.append((a, b))
-    return merged
 
 
 if __name__ == "__main__":

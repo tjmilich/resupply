@@ -19,6 +19,8 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 ```bash
 resupply ride.gpx                        # writes ride_resupply.html + ride_cues.csv next to the GPX
 resupply ride.gpx -o out/ --units mi --max-gap 40
+resupply ride.gpx -r 0.5mi --units mi      # search half a mile either side of the route
+resupply ride.gpx -r "1km,water=300m,campsite=5km"   # per-category search distances
 resupply ride.gpx -r 500 -c water,supermarket,convenience --max-water-gap 25 --max-food-gap 60
 resupply ride.gpx --refresh              # re-query Overpass, ignoring cached responses
 ```
@@ -27,7 +29,7 @@ Key options (`resupply -h` lists them all):
 
 | option | default | meaning |
 |---|---|---|
-| `-r/--radius` | 1000 m | max offset from the route |
+| `-r/--radius` | 1km | how far off the route to look: `500m`, `1.5km`, `0.5mi`, `800ft` (bare number = metres), or per category, e.g. `water=300m,campsite=5km` / `2km,water=300m` |
 | `-c/--categories` | all | `water,supermarket,fuel,convenience,campsite,bike_shop` |
 | `--max-gap` | 50 km / 30 mi | flag stretches with no water **or** no food longer than this |
 | `--max-water-gap`, `--max-food-gap` | = `--max-gap` | separate thresholds per resource (0 disables) |
@@ -36,6 +38,48 @@ Key options (`resupply -h` lists them all):
 | `--simplify` | 50 m | Douglas–Peucker tolerance used for the query polyline |
 | `--chunk-points`, `--chunk-km` | 150, 50 | per-query limits |
 | `--cache-dir`, `--cache-ttl-days` | `~/.cache/resupply`, 30 | disk cache |
+| `--extract DIR`, `--no-extract` | bundled | offline data to use where it has coverage / always query live |
+
+## Offline data (fast, no server needed)
+
+The public Overpass server is often overloaded. For the regions below, resupply ships a pre-built extract of just
+the places it looks for, so routes there are answered in seconds with no live queries:
+
+> Maine, Vermont, New Hampshire, Massachusetts, Connecticut, Rhode Island, New York, New Jersey, Pennsylvania,
+> Delaware, Maryland, District of Columbia, Virginia
+
+A route is split into stretches. Each stretch whose search corridor lies entirely inside the covered area is
+answered from the extract, and everything else falls back to live Overpass. The output says which was used and how
+old the offline data is.
+
+How the extract is built (`resupply-extract`, needs `pip install 'resupply[extract]'`):
+
+1. For each region, download the Geofabrik `.osm.pbf` and its boundary `.poly`.
+2. Keep only features matching a resupply category, using the same rules as live queries. Ways and multipolygons
+   become points, and only the tags resupply uses are kept.
+3. Delete the download before starting the next region. Peak disk use is one regional file, under 0.5 GB here.
+4. Write the result as 1° tiles (`src/resupply/data/extract/tiles/*.jsonl.gz`) plus a `manifest.json` holding the
+   coverage outline and the data date.
+
+A GitHub Action (`.github/workflows/refresh-extract.yml`) rebuilds it on the 3rd of each month. You can also run it
+from the Actions tab. To build other areas yourself:
+
+```bash
+resupply-extract north-america/us/ohio north-america/us/michigan -o my-extract
+resupply ride.gpx --extract my-extract
+```
+
+## Web app
+
+`streamlit_app.py` is a browser front end to the same pipeline. Upload a GPX, pick the options, and view the map,
+cue sheet and downloads. It works on phones too.
+
+```bash
+pip install -e '.[web]' && streamlit run streamlit_app.py
+```
+
+To host it for free: on [share.streamlit.io](https://share.streamlit.io), sign in with GitHub, choose **New app**,
+pick this repository, branch `main` and file `streamlit_app.py`, then **Deploy**.
 
 ## How it works
 
@@ -63,6 +107,9 @@ Design notes:
   is missed. Results are then filtered against the true route with the requested radius.
 - **Multiple passes:** on out-and-back, loop and figure-eight routes, a POI next to two different parts of the route
   gets one cue row per pass. The map shows one marker with all the distances.
+- **Per-category radius:** each category's Overpass statement uses its own radius, so asking for campsites
+  within 5 km doesn't download every water tap within 5 km. Each POI is also filtered and split into passes
+  using its own category's limit.
 - **Merging duplicates:** OpenStreetMap often maps one stop as several features, such as a fuel station, its shop
   and individual pump nodes. Features within `--merge-distance` (60 m) on the same pass of the route become one cue
   row, for example "Love's: Gas station + Convenience store". Separately named businesses never merge. Water,
@@ -92,14 +139,20 @@ stretches had no usable map data.
 
 ```
 src/resupply/
-  cli.py         argument parsing and orchestration
+  cli.py         argument parsing
+  pipeline.py    the full analysis (shared by CLI and web app); offline vs live per stretch
+  extract.py     build offline extracts from Geofabrik; read them (LocalExtract)
+  distances.py   "0.5mi" / "water=300m,campsite=5km" parsing
+  data/extract/  bundled offline extract (northeast US)
   categories.py  category definitions → Overpass filters / classifier / provides
   route.py       GPX loading, projection, geodesic distances, simplify, densify, chunk
   overpass.py    query builder, HTTP client (retry, throttle, fallback), DiskCache
   analysis.py    POIs, snapping/multi-pass, next water/food, gaps
   output.py      CSV cue sheet and folium map
+streamlit_app.py web app
 tests/           offline tests (fake Overpass session, synthetic routes)
 examples/        demo GPX (Boulder → Lyons, CO)
+.github/workflows/refresh-extract.yml   monthly offline-data rebuild
 ```
 
 ```bash

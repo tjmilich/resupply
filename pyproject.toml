@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "resupply"
-version = "0.3.0"
+version = "0.5.0"
 description = "Find water, food, fuel, camping and bike shops along a GPX route using OpenStreetMap"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -18,13 +18,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "osmium>=4"]
+extract = ["osmium>=4"]
+web = ["streamlit>=1.40", "pandas>=2.0"]
 
 [project.scripts]
 resupply = "resupply.cli:main"
+resupply-extract = "resupply.extract:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+resupply = ["data/extract/manifest.json", "data/extract/tiles/*.jsonl.gz"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

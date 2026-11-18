@@ -6,9 +6,10 @@ import hashlib
 import json
 import logging
 import os
+import random
 import time
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 import requests
 
@@ -18,9 +19,10 @@ from .route import LatLon
 
 log = logging.getLogger(__name__)
 
+# overpass.kumi.systems used to be a common mirror but accepted connections and never answered
+# throughout testing (Nov 2026), costing a 240 s timeout per run; add mirrors with --endpoint.
 DEFAULT_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter",
 ]
 RETRY_STATUS = {429, 500, 502, 503, 504}
 # Every query also counts highway ways this close to the chunk's polyline. A real route
@@ -28,6 +30,7 @@ RETRY_STATUS = {429, 500, 502, 503, 504}
 # broken or empty database (observed on overpass-api.de: identical queries randomly
 # returning zero elements with HTTP 200 and no error remark).
 CANARY_RADIUS_M = 150
+RETRY_ROUND_PAUSE_S = 60.0  # pause before re-trying chunks that failed in the first round
 
 
 class OverpassError(RuntimeError):
@@ -59,19 +62,26 @@ def default_cache_dir() -> Path:
     return Path(base) / "resupply"
 
 
-def build_query(coords: list[LatLon], radius_m: float, categories: Iterable[Category], timeout_s: int = 180) -> str:
+def build_query(
+    coords: list[LatLon],
+    radius_m: float | Mapping[str, float],
+    categories: Iterable[Category],
+    timeout_s: int = 180,
+) -> str:
     """Build an Overpass QL query for all category filters around a polyline.
 
     ``around:R,lat1,lon1,lat2,lon2,...`` treats the coordinate list as a
     polyline, so the corridor follows the route rather than a bounding box.
     Coordinates are rounded to 6 dp so the text (and thus the cache key) is stable.
+    ``radius_m`` is one radius for all categories, or a {category key: metres} map.
     """
     if len(coords) < 1:
         raise ValueError("need at least one coordinate")
     coord_str = ",".join(f"{lat:.6f},{lon:.6f}" for lat, lon in coords)
-    around = f"(around:{radius_m:.0f},{coord_str})"
     lines = [f"[out:json][timeout:{timeout_s}];", "("]
     for cat in categories:
+        r = radius_m[cat.key] if isinstance(radius_m, Mapping) else radius_m
+        around = f"(around:{r:.0f},{coord_str})"
         for flt in cat.overpass_filters():
             lines.append(f"  nwr{flt}{around};")
     lines += [
@@ -123,8 +133,10 @@ class OverpassClient:
         endpoints: list[str] | None = None,
         cache: DiskCache | None = None,
         session: requests.Session | None = None,
-        max_retries: int = 5,
+        max_retries: int = 6,
         backoff_s: float = 5.0,
+        max_backoff_s: float = 120.0,
+        jitter: float = 0.25,
         min_interval_s: float = 1.0,
         http_timeout_s: float = 240.0,
         connect_timeout_s: float = 10.0,
@@ -135,6 +147,8 @@ class OverpassClient:
         self.session = session or requests.Session()
         self.max_retries = max_retries
         self.backoff_s = backoff_s
+        self.max_backoff_s = max_backoff_s
+        self.jitter = jitter
         self.min_interval_s = min_interval_s
         self.http_timeout_s = http_timeout_s
         self.connect_timeout_s = connect_timeout_s
@@ -219,7 +233,11 @@ class OverpassClient:
                     raise OverpassError(f"HTTP {resp.status_code} from {endpoint}: {resp.text[:500]}")
             self._next += 1  # rotate away from the endpoint that just failed
             if attempt < self.max_retries - 1:
-                delay = self.backoff_s * (2**attempt)
+                # Exponential backoff, capped, with jitter so concurrent clients don't retry in lockstep
+                # (overpass-api.de's 502 "at capacity" page asks for exactly this).
+                delay = min(self.backoff_s * (2**attempt), self.max_backoff_s)
+                if self.jitter:
+                    delay *= random.uniform(1 - self.jitter, 1 + self.jitter)
                 log.warning("Overpass request failed (%s); retrying in %.0fs", last_err, delay)
                 self._sleep(delay)
         cls = SuspectResponse if isinstance(last_err, SuspectResponse) else OverpassError
@@ -229,30 +247,68 @@ class OverpassClient:
 def fetch_elements(
     client: OverpassClient,
     chunks: list[list[LatLon]],
-    radius_m: float,
+    radius_m: float | Mapping[str, float],
     categories: list[Category],
     refresh: bool = False,
+    on_progress: Callable[[int, int], None] | None = None,
+    retry_pause_s: float | None = None,
 ) -> tuple[list[dict], list[int]]:
     """Query every chunk.
 
     Returns OSM elements de-duplicated across chunks, and the 0-based indices of chunks
-    for which no trustworthy data could be obtained (see ``SuspectResponse``). Those
-    chunks are skipped rather than aborting the run; callers must report them.
+    for which no data could be obtained. A chunk that fails (server errors, bogus empty
+    answers, timeouts) does not abort the run: failed chunks get a second round after
+    all others, since public Overpass failures are usually intermittent. Callers must
+    report the chunks that are still missing. Raises OverpassError only if every chunk
+    failed, i.e. the server is effectively down.
     """
     seen: dict[tuple[str, int], dict] = {}
-    missing: list[int] = []
-    for i, chunk in enumerate(chunks, 1):
-        q = build_query(chunk, radius_m, categories)
+    n = len(chunks)
+    queries = [build_query(c, radius_m, categories) for c in chunks]
+    done = 0
+    last_err: Exception | None = None
+
+    def attempt(i: int, final: bool) -> bool:
+        nonlocal last_err
+        q = queries[i]
         if refresh or not client.is_cached(q):
-            log.info("chunk %d/%d: querying Overpass...", i, len(chunks))
+            log.info("chunk %d/%d: querying Overpass...", i + 1, n)
         try:
             data, cached = client.query(q, refresh=refresh)
-        except SuspectResponse as e:
-            log.warning("chunk %d/%d: no usable data (%s)", i, len(chunks), e)
-            missing.append(i - 1)
-            continue
+        except OverpassError as e:
+            last_err = e
+            if final:
+                log.warning("chunk %d/%d: no usable data (%s)", i + 1, n, e)
+            else:
+                log.warning("chunk %d/%d: failed (%s); will retry after the other chunks", i + 1, n, e)
+            return False
         elements = [el for el in data.get("elements", []) if el.get("type") != "count"]
-        log.info("chunk %d/%d: %d features%s", i, len(chunks), len(elements), " (cached)" if cached else "")
+        log.info("chunk %d/%d: %d features%s", i + 1, n, len(elements), " (cached)" if cached else "")
         for el in elements:
             seen.setdefault((el["type"], el["id"]), el)
+        return True
+
+    failed = []
+    for i in range(n):
+        if not attempt(i, final=False):
+            failed.append(i)
+        else:
+            done += 1
+            if on_progress:
+                on_progress(done, n)
+
+    missing = []
+    if failed:
+        pause = RETRY_ROUND_PAUSE_S if retry_pause_s is None else retry_pause_s
+        log.warning("Retrying %d failed chunk(s) in %.0fs...", len(failed), pause)
+        client._sleep(pause)
+        for i in failed:
+            if not attempt(i, final=True):
+                missing.append(i)
+            done += 1
+            if on_progress:
+                on_progress(done, n)
+
+    if n and len(missing) == n:
+        raise OverpassError(f"no Overpass data for any part of the route; the server may be down ({last_err})")
     return list(seen.values()), missing

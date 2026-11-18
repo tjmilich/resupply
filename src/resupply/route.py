@@ -94,12 +94,21 @@ def load_gpx(path: str | Path) -> Route:
     """Load all track segments (or, failing that, routes) from a GPX file, in order."""
     path = Path(path)
     try:
-        with path.open(encoding="utf-8") as f:
-            gpx = gpxpy.parse(f)
-    except OSError as e:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
         raise RouteError(f"cannot read {path}: {e}") from e
+    return parse_gpx(text, fallback_name=path.stem, source=str(path))
+
+
+def parse_gpx(text: str | bytes, fallback_name: str = "route", source: str = "GPX") -> Route:
+    """Build a Route from GPX text (e.g. an uploaded file)."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8-sig", errors="replace")
+    try:
+        gpx = gpxpy.parse(text)
     except gpxpy.gpx.GPXException as e:
-        raise RouteError(f"invalid GPX in {path}: {e}") from e
+        raise RouteError(f"invalid GPX in {source}: {e}") from e
+    path = Path(fallback_name)
 
     pts: list[LatLon] = []
     for trk in gpx.tracks:
@@ -109,7 +118,7 @@ def load_gpx(path: str | Path) -> Route:
         for rte in gpx.routes:
             pts.extend((p.latitude, p.longitude) for p in rte.points)
     if not pts:
-        raise RouteError(f"{path} contains no track or route points")
+        raise RouteError(f"{source} contains no track or route points")
 
     name = gpx.name or next((t.name for t in gpx.tracks if t.name), None) or next(
         (r.name for r in gpx.routes if r.name), None

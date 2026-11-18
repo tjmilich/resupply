@@ -5,6 +5,7 @@ from __future__ import annotations
 import bisect
 import re
 from dataclasses import dataclass, field
+from typing import Mapping
 
 import numpy as np
 import shapely
@@ -115,7 +116,12 @@ def pois_from_elements(elements: list[dict], categories: list[Category], fuel_as
     return pois
 
 
-def locate(route: Route, pois: list[POI], max_offset_m: float, pass_separation_m: float | None = None) -> list[Stop]:
+def locate(
+    route: Route,
+    pois: list[POI],
+    max_offset_m: float | Mapping[str, float],
+    pass_separation_m: float | None = None,
+) -> list[Stop]:
     """Snap POIs to the full-resolution route.
 
     Candidate segments come from an STRtree ``dwithin`` query in the local
@@ -123,17 +129,24 @@ def locate(route: Route, pois: list[POI], max_offset_m: float, pass_separation_m
     into *passes*: runs of segments whose along-route distance is contiguous.
     Separate passes (out-and-back, loops, figure-eights) become separate stops.
     Final along-route distance and offset are geodesic.
+
+    ``max_offset_m`` is one limit for every POI, or a {category key: metres} map
+    (categories missing from the map use its largest value).
     """
     if not pois:
         return []
-    if pass_separation_m is None:
-        pass_separation_m = max(2 * max_offset_m, 1000.0)
+    if isinstance(max_offset_m, Mapping):
+        widest = max(max_offset_m.values())
+        limits = [max_offset_m.get(p.category.key, widest) for p in pois]
+    else:
+        widest = max_offset_m
+        limits = [max_offset_m] * len(pois)
 
     xy = route.xy
     a_all, b_all = xy[:-1], xy[1:]
     tree = shapely.STRtree(shapely.linestrings(np.stack([a_all, b_all], axis=1)))
     px, py = route.to_xy([p.lat for p in pois], [p.lon for p in pois])
-    search = max_offset_m * 1.25 + 50.0
+    search = widest * 1.25 + 50.0
     poi_idx, seg_idx = tree.query(shapely.points(px, py), predicate="dwithin", distance=search)
 
     order = np.lexsort((seg_idx, poi_idx))
@@ -154,15 +167,23 @@ def locate(route: Route, pois: list[POI], max_offset_m: float, pass_separation_m
         proj = a + t[:, None] * ab
         dist = np.hypot(*(p - proj).T)
 
+        # The tree was searched with the widest radius; keep only segments within this POI's
+        # own limit, otherwise a wide category (e.g. campsites) glues separate passes together.
+        near = dist <= limits[i] * 1.25 + 50.0
+        if not near.any():
+            continue
+        s_rows, t, proj, dist, a, ab = s_rows[near], t[near], proj[near], dist[near], a[near], ab[near]
+
         # split candidates into passes where along-route distance jumps
-        jumps = route.cum_m[s_rows[1:]] - route.cum_m[s_rows[:-1] + 1] > pass_separation_m
+        sep = pass_separation_m if pass_separation_m is not None else max(2 * limits[i], 1000.0)
+        jumps = route.cum_m[s_rows[1:]] - route.cum_m[s_rows[:-1] + 1] > sep
         groups = np.split(np.arange(len(s_rows)), np.flatnonzero(jumps) + 1)
         for g in groups:
             j = g[np.argmin(dist[g])]
             seg = int(s_rows[j])
             slat, slon = route.to_latlon(proj[j, 0], proj[j, 1])
             _, _, offset = GEOD.inv(poi.lon, poi.lat, float(slon), float(slat))
-            if offset > max_offset_m:
+            if offset > limits[i]:
                 continue
             along = float(route.cum_m[seg] + t[j] * route.seg_m[seg])
             cross = ab[j, 0] * (p[1] - a[j, 1]) - ab[j, 1] * (p[0] - a[j, 0])

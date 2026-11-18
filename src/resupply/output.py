@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import csv
 import html
+import io
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 import folium
 
@@ -69,7 +71,7 @@ def missing_message(start_m: float, end_m: float, units: Units) -> str:
 
 
 def write_csv(
-    path: str | Path,
+    path: str | Path | IO[str],
     stops: list[Stop],
     gaps: list[Gap],
     units: Units = KM,
@@ -128,10 +130,21 @@ def write_csv(
         row[4] = missing_message(a, b, units)
         rows.append((a, -1, row))
     rows.sort(key=lambda r: (r[0], r[1]))
+    if hasattr(path, "write"):
+        w = csv.writer(path)
+        w.writerow(header)
+        w.writerows(r[2] for r in rows)
+        return
     with Path(path).open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(header)
         w.writerows(r[2] for r in rows)
+
+
+def csv_text(stops: list[Stop], gaps: list[Gap], units: Units = KM, missing: list[tuple[float, float]] = ()) -> str:
+    buf = io.StringIO()
+    write_csv(buf, stops, gaps, units, missing)
+    return buf.getvalue()
 
 
 def _nice_interval(length: float) -> float:
@@ -174,6 +187,20 @@ def write_map(
     units: Units = KM,
     missing: list[tuple[float, float]] = (),
 ) -> None:
+    build_map(route, stops, gaps, units, missing).save(str(path))
+
+
+def map_html(route: Route, stops: list[Stop], gaps: list[Gap], units: Units = KM, missing=()) -> str:
+    return build_map(route, stops, gaps, units, missing).get_root().render()
+
+
+def build_map(
+    route: Route,
+    stops: list[Stop],
+    gaps: list[Gap],
+    units: Units = KM,
+    missing: list[tuple[float, float]] = (),
+) -> folium.Map:
     lats, lons = route.lat, route.lon
     bounds = [[float(lats.min()), float(lons.min())], [float(lats.max()), float(lons.max())]]
     m = folium.Map(location=[float(lats.mean()), float(lons.mean())], zoom_start=10, tiles=None, control_scale=True)
@@ -273,7 +300,7 @@ def write_map(
             ).add_to(fg)
         fg.add_to(m)
 
-    folium.LayerControl(collapsed=False).add_to(m)
+    folium.LayerControl(collapsed=True).add_to(m)  # expanded, it covers the map on phones
     m.fit_bounds(bounds)
 
     summary = (
@@ -287,4 +314,4 @@ def write_map(
         f'padding:8px 10px;border-radius:6px;font:12px sans-serif;box-shadow:0 1px 4px rgba(0,0,0,.3);">'
         f"{summary}</div>"
     ))
-    m.save(str(path))
+    return m

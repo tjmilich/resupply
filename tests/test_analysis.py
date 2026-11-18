@@ -191,3 +191,22 @@ def test_merge_disabled_and_next_recomputed():
     merged = merge_nearby(raw)
     assert len(merged) == 2
     assert merged[0].next_water_m == pytest.approx(merged[1].along_m - merged[0].along_m)
+
+
+def test_per_category_offset_limits():
+    # both ~850 m east of the route
+    els = [
+        node(1, 40.1, -104.99, amenity="drinking_water"),
+        node(2, 40.2, -104.99, tourism="camp_site"),
+    ]
+    stops = locate(north_route(), pois_from_elements(els, CATS), {"water": 300, "campsite": 5000})
+    assert [s.poi.osm_id for s in stops] == [2]
+
+
+def test_narrow_category_keeps_its_own_pass_separation():
+    # out-and-back 3 km spur; campsites searched to 5 km must not merge the water tap's two passes
+    out = straight_north(40.0, 40.027)
+    route = Route(*zip(*(out + out[::-1][1:])))
+    els = [node(1, 40.005, -104.9995, amenity="drinking_water")]
+    stops = locate(route, pois_from_elements(els, CATS), {"water": 300, "campsite": 5000})
+    assert len(stops) == 2
